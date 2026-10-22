@@ -1108,9 +1108,11 @@ body{font-family:'Manrope',sans-serif;color:#ece7df;-webkit-font-smoothing:antia
       // A reply sent before arranging or saving must not replace local edits.
       if (revision !== layoutRevision || ((layoutBusy || state.arranging) && !whileArranging)) return;
       var firstLoad = !data;
+      var clockChanged = !data || !data.clock12 !== !r.clock12;
       data = r;
       layout = r.layout;
       applyColours(layout.colours);
+      if (clockChanged) renderNow();
       if (r.layoutVersion) layoutVersion = r.layoutVersion;
       refreshPicture();
       clearTimeout(loadRetry);
