@@ -19,7 +19,7 @@
  * first 4096 bytes of a downloaded tvweb.js for this line (up to 0.82.2), and
  * refuses a release where it is further down (#586).
  */
-var TVWEB_VERSION = '0.118.0';
+var TVWEB_VERSION = '0.120.0';
 
 var http = require('http');
 var fs = require('fs');
@@ -49,6 +49,7 @@ var privacy = require('./lib/privacy');
 var devtools = require('./lib/devtools');
 var oled = require('./lib/oled');
 var screensavers = require('./lib/screensavers');
+var idlesaver = require('./lib/idlesaver');
 var appsModule = require('./lib/apps');
 var iconServer = require('./lib/iconserver');
 var samrescan = require('./lib/samrescan');
@@ -56,6 +57,7 @@ var servicesModule = require('./lib/services');
 var preload = require('./lib/preload');
 var quickAccess = require('./lib/quickaccess');
 var remoteKeys = require('./lib/remotekeys');
+var clockFormat = require('./lib/clock');
 var homeScreen = require('./lib/homescreen');
 /*
  * Glasshouse Home is loaded apart from the rest: one of its files missing from
@@ -94,6 +96,7 @@ var ntpClient = require('./lib/ntp');
 var history = require('./lib/history');
 var sshKeys = require('./lib/sshkeys');
 var screentime = require('./lib/screentime');
+var saverPowerOff = require('./lib/saverpoweroff');
 var remoteBattery = require('./lib/remotebattery');
 var backup = require('./lib/backup');
 var power = require('./lib/power');
@@ -536,10 +539,13 @@ remoteKeys.init({ luna: luna, subscription: lunaTransport.Subscription, services
 homeScreen.init({ luna: luna, config: CONFIG, inputNames: telemetry.inputNameMap, stateDir: __dirname, webosVersion: telemetry.detectWebosVersion() });
 // webOS 10's layout is an overlay mount, gone after a restart of the TV.
 homeScreen.reapply();
+// The TV's own 12 or 24 hour setting, for every clock Glasshouse draws. A
+// change restages a clock screen saver, which has it written into its file.
+clockFormat.init({ luna: luna, onChange: function () { screensavers.restageScreensaver(); } });
 screensavers.init({
   luna: luna,
+  hour12: clockFormat.hour12,
   webosVersion: telemetry.detectWebosVersion(),
-  assetPath: assetPath,
   config: CONFIG,
   injectKey: controls.injectKey,
   KEY_BACK: controls.KEY_BACK,
@@ -547,6 +553,7 @@ screensavers.init({
   watchKeys: function (on) { if (!on || remotebuttons.isSupported()) remotebuttons.want('screensaver', on); },
   mediaState: telemetry.readMediaState
 });
+idlesaver.init({ luna: luna, mediaState: telemetry.readMediaState });
 telemetry.init({
   luna: luna,
   lunaCached: lunaCached,
@@ -642,7 +649,6 @@ controls.init({
   ntp: ntpClient,
   history: history,
   backup: backup,
-  home: glasshouseHome,
   republishDiscovery: function () { republishDiscovery(); },
   tvApp: tvApp,
   restartSelf: restartSelf,
@@ -880,6 +886,7 @@ function appsChanged() {
 
 routes.init({
   config: CONFIG,
+  clock: clockFormat,
   piccapStatus: piccap.status,
   repo: repo,
   installer: installer,
@@ -1268,6 +1275,10 @@ function setupHomeAssistant() {
     if (ev.group !== 'power' && mqttClient.connected) pusher.changed();
   };
   var lastAppSig = '';
+  // The input chosen from Home Assistant, { id, until }, while the TV switches.
+  var pendingInput = null;
+  // The last telemetry published, to say a chosen input in at once.
+  var lastPub = null;
   var lastInputSig = '';
   var lastCapSig = '';
 
@@ -1384,6 +1395,15 @@ function setupHomeAssistant() {
        */
       var pub = {};
       for (var pk in s) if (pk !== 'apps' && pk !== 'temps' && pk !== 'cpuTimes') pub[pk] = s[pk];
+      /*
+       * What Input Source shows: the input just chosen, until the TV reports it
+       * or 10 s have passed. A B8 (webOS 4.4) took about 4 s to switch and
+       * meanwhile reported the input it was leaving, so the select jumped back
+       * to that before showing the new one.
+       */
+      if (pendingInput && (s.app === pendingInput.id || Date.now() > pendingInput.until)) pendingInput = null;
+      pub.input_source = pendingInput ? pendingInput.id : s.app;
+      lastPub = pub;
       mqttClient.publish(mqttTopics.telemetry, JSON.stringify(pub), true);
       MQTT_STATUS.lastPublish = Date.now();
       pusher.finished();
@@ -1492,6 +1512,18 @@ function setupHomeAssistant() {
     var action = topic.substring(mqttTopics.commands.length);
     var val = payload ? payload.trim() : '';
     console.log('mqtt: command received: ' + action + ' -> ' + val);
+    if (action === 'input' && val) {
+      pendingInput = { id: val, until: Date.now() + 10000 };
+      /*
+       * Said at once, not at the next telemetry: Home Assistant shows the
+       * choice, then puts back the state it last heard until a new one comes,
+       * and while it shows the old input, choosing that again sends nothing.
+       */
+      if (lastPub) {
+        lastPub.input_source = val;
+        mqttClient.publish(mqttTopics.telemetry, JSON.stringify(lastPub), true);
+      }
+    }
 
     if (piccap.handleMqttCommand(action, val)) return;
 
@@ -1732,6 +1764,8 @@ function startGlasshouseHome() {
   var homeWatchesForeground = false;
   glasshouseHome.init({
     luna: luna,
+    Subscription: lunaTransport.Subscription,
+    blockedBy: privacy.blockedBy,
     allowExperimental: function () { return CONFIG.allowExperimentalHome === true; },
     liveState: liveState,
     history: history,
@@ -1759,6 +1793,7 @@ function startGlasshouseHome() {
 
 if (!CLI_MODE) {
   heartbeat();
+  clockFormat.refresh();
   setInterval(heartbeat, 20000);
 
   // HDMI tile titles on webOS 9's Home (lib/homescreen.js): EIM cannot be
@@ -1784,6 +1819,7 @@ if (!CLI_MODE) {
   liveState.state.onChange(function (ev) {
     if (ev.group === 'power' && ev.key === 'state') power.stateChanged(ev.value);
   });
+  liveState.groups.power.onReply = idlesaver.powerReply;
   // Its own start, as the MQTT bridge starts every group only with a broker.
   liveState.startGroup('power');
   liveState.state.onChange(function (ev) {
@@ -1801,6 +1837,8 @@ if (!CLI_MODE) {
   history.start();
   screentime.init({ config: CONFIG, liveState: liveState, control: controls.doControl, injectKey: controls.injectKey, keyBack: controls.KEY_BACK });
   screentime.start();
+  saverPowerOff.init({ config: CONFIG, liveState: liveState, control: controls.doControl });
+  saverPowerOff.start();
 
   if (glasshouseHome && homePicture) startGlasshouseHome();
   else releaseUnloadedHome();
