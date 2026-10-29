@@ -35,8 +35,11 @@ function advPill(row, id, on) {
 function flip(id) { const el = q(id); return el && el.dataset.on ? 'off' : 'on'; }
 function toggleLight(which) { sendCommand(which, flip(which === 'standbyLight' ? 'lt_standby' : 'lt_logo')); }
 function toggleQuickBoot() { sendCommand('quickBoot', flip('btn_quickboot')); }
+function toggleHomeAutoLaunch(id) { sendCommand('homeAutoLaunch', flip(id || 'home-autolaunch')); }
+function toggleClockHour12() { sendCommand('clockHour12', flip('btn_clock12')); }
 function toggleLgLogo() { sendCommand('lgLogo', flip('btn_lglogo')); }
 function togglePiccap() { sendCommand('piccap', flip('btn_piccap')); }
+function toggleHuesync() { sendCommand('huesync', flip('btn_huesync')); }
 function toggleWol() { sendCommand('wakeOnLan', flip('btn_wol')); }
 function toggleDeviceDetection() { sendCommand('deviceDetection', flip('btn_devdetect')); }
 function toggleAlwaysReady() { sendCommand('alwaysReady', flip('btn_ar')); }
@@ -126,6 +129,13 @@ function applyOptimistic(action, value) {
     const on = value === 'on' || value === true;
     setLease('quickBoot', on);
     advPill('quickboot', 'btn_quickboot', on);
+  } else if (action === 'homeAutoLaunch') {
+    const on = value === 'on' || value === true;
+    setLease('homeAutoLaunch', on);
+    advPill('homeautolaunch', 'btn_homeautolaunch', on);
+    const hb = q('home-autolaunch');
+    if (hb) updateToggle(hb, { cls: on ? 'good' : 'idle', label: on ? t('common.on', 'On') : t('common.off', 'Off'), on: on });
+    if (typeof homeStatus === 'object' && homeStatus) homeStatus.homeAutoLaunch = on;
   } else if (action === 'alwaysReady') {
     const on = value === 'on' || value === true;
     setLease('alwaysReady', on);
@@ -145,6 +155,14 @@ function applyOptimistic(action, value) {
     const on = value === 'on' || value === true;
     setLease('wakeOnLan', on);
     advPill('wol', 'btn_wol', on);
+  } else if (action === 'clockHour12') {
+    const on = value === 'on' || value === true;
+    setLease('clockHour12', on);
+    advPill('clock12', 'btn_clock12', on);
+    if (typeof homeStatus === 'object' && homeStatus) {
+      homeStatus.clockHour12 = on;
+      if (typeof renderHomeColours === 'function') renderHomeColours();
+    }
   } else if (action === 'lgLogo') {
     const on = value === 'on' || value === true;
     setLease('lgLogo', on);
@@ -153,6 +171,10 @@ function applyOptimistic(action, value) {
     const on = value === 'on' || value === true;
     setLease('piccap', on);
     advPill('piccap', 'btn_piccap', on);
+  } else if (action === 'huesync') {
+    const on = value === 'on' || value === true;
+    setLease('huesync', on);
+    advPill('huesync', 'btn_huesync', on);
   } else if (action === 'standbyLight') {
     const on = value === 'on' || value === true;
     setLease('standbyLight', on);
@@ -166,6 +188,79 @@ function applyOptimistic(action, value) {
     setLease('deviceDetection', on);
     advPill('devdetect', 'btn_devdetect', on);
   }
+}
+
+// Tracks what the TV's field has actually received so far, so each keystroke
+// (including backspace) can be sent as a small diff instead of the whole line.
+let kbSynced = '';
+let kbSyncing = false;
+let kbResyncNeeded = false;
+
+function kbCommonPrefixLen(a, b) {
+  const max = Math.min(a.length, b.length);
+  let i = 0;
+  while (i < max && a[i] === b[i]) i++;
+  return i;
+}
+
+// A keystroke's change, sent on its own: sendCommand refreshes every reading
+// after each command, which held typing up when it ran for every letter.
+async function kbSend(action, value) {
+  try {
+    const r = await fetch(api('/api/control'), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action, value })
+    });
+    const j = await r.json();
+    if (!j.ok) showErr(j.error || t('common.actionFailed', 'Action failed'));
+    return j;
+  } catch (e) {
+    showErr(e.message);
+    return null;
+  }
+}
+
+async function kbSyncLive() {
+  const el = document.getElementById('kb-text');
+  if (!el) return;
+  if (kbSyncing) { kbResyncNeeded = true; return; }
+  const cur = el.value;
+  if (cur === kbSynced) return;
+  kbSyncing = true;
+  const prefixLen = kbCommonPrefixLen(kbSynced, cur);
+  const del = kbSynced.length - prefixLen;
+  const text = cur.slice(prefixLen);
+  const sentAsOf = cur;
+  try {
+    const r = await kbSend('sendText', { text, replace: del });
+    if (r && r.ok) kbSynced = sentAsOf;
+  } finally {
+    kbSyncing = false;
+    if (kbResyncNeeded) { kbResyncNeeded = false; kbSyncLive(); }
+  }
+}
+
+// Enter: the text is already on the TV, so this submits it through LG's input
+// method, as its keyboard's Enter does. OK would press the key LG's keyboard
+// has in focus. The box starts again empty, as the TV's field has moved on.
+async function sendTypedText() {
+  await kbSyncLive();
+  await kbSend('keyboardKey', 'enter');
+  const el = document.getElementById('kb-text');
+  if (el) el.value = '';
+  kbSynced = '';
+}
+
+// Whether LG's on-screen keyboard is up, where the TV says (webOS 6 and later);
+// a hint only, as some apps draw a keyboard of their own.
+function renderKeyboardHint(d) {
+  const hint = document.getElementById('kb-hint');
+  if (!hint) return;
+  hint.textContent = d.keyboardUp === true
+    ? t('ctl.keyboard.up', 'LG\u2019s keyboard is up on the TV: what you type here goes to its field as you type, backspace included, and Enter submits it.')
+    : d.keyboardUp === false
+      ? t('ctl.keyboard.down', 'LG\u2019s keyboard is not up on the TV. Select a text field there first, such as a search box or a web address. Some apps use a keyboard of their own instead.')
+      : t('ctl.keyboard.hint', 'Focus a text field on the TV first, such as a search box or a web address. What you type here goes to it as you type, backspace included, and Enter submits it.');
 }
 
 async function sendCommand(action, value) {

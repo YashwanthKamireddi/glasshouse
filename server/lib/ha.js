@@ -7,15 +7,25 @@ var msg = require('./say').msg;
 
 // Screen saver names come from the registry, so a new one reaches Home
 // Assistant without a second list to keep in step (Bokeh was missed once).
-var SS = require('./screensavers').SCREENSAVERS;
+var screensavers = require('./screensavers');
+var remotebuttons = require('./remotebuttons');
 var topics = require('./topics');
 var names = require('./names');
 var hexColor = require('./util').hexColor;
 var APP_ID_RE = require('./iconserver').APP_ID_RE;
-var SS_IDS = Object.keys(SS);
-function ssMap(byLabel) {
+// The screen savers that can be picked, as Home Assistant's select names them:
+// [id, name] pairs, a name made unique with its id where two are the same.
+function ssChoices() {
+  var seen = {};
+  return screensavers.catalog().filter(function (e) { return !e.problem; }).map(function (e) {
+    var name = seen[e.label] ? e.label + ' (' + e.id + ')' : e.label;
+    seen[name] = true;
+    return [e.id, name];
+  });
+}
+function ssMap(choices, byLabel) {
   var m = {};
-  SS_IDS.forEach(function (k) { if (byLabel) m[SS[k].label] = k; else m[k] = SS[k].label; });
+  choices.forEach(function (c) { if (byLabel) m[c[1]] = c[0]; else m[c[0]] = c[1]; });
   return m;
 }
 
@@ -47,6 +57,7 @@ var HA_ENTITIES = [
   { id: 'volume', type: 'number', name: 'Volume', cat: 'controls' },
   { id: 'input_source', type: 'select', name: 'Input Source', cat: 'controls' },
   { id: 'piccap', type: 'switch', name: 'PicCap Capture', cat: 'controls' },
+  { id: 'huesync', type: 'switch', name: 'Hue Sync', cat: 'controls' },
   { id: 'screen_notification', type: 'text', name: 'Screen Notification', cat: 'controls' },
   { id: 'picture_mode', type: 'select', name: 'Picture Mode (Select)', cat: 'controls' },
   { id: 'energy_saving', type: 'select', name: 'Energy Saving Step', cat: 'controls' },
@@ -64,6 +75,9 @@ var HA_ENTITIES = [
   { id: 'remote_ok', type: 'button', name: 'Remote OK', cat: 'controls' },
   { id: 'remote_back', type: 'button', name: 'Remote Back', cat: 'controls' },
   { id: 'remote_home', type: 'button', name: 'Remote Home', cat: 'controls' },
+  { id: 'keyboard_text', type: 'text', name: 'Keyboard Text', cat: 'controls' },
+  { id: 'keyboard_enter', type: 'button', name: 'Keyboard Enter', cat: 'controls' },
+  { id: 'keyboard_backspace', type: 'button', name: 'Keyboard Backspace', cat: 'controls' },
   { id: 'remote_button', type: 'event', name: 'Remote Button', cat: 'controls' },
   { id: 'play', type: 'button', name: 'Play', cat: 'controls' },
   { id: 'pause', type: 'button', name: 'Pause', cat: 'controls' },
@@ -350,6 +364,14 @@ function inputSourceNames(custom) {
   return byId;
 }
 
+// The Input Source select's options mapped to their inputs, as Launch App's
+// app_ids maps titles to app ids.
+function inputIds(byId) {
+  var out = {};
+  Object.keys(byId).forEach(function (id) { if (!out.hasOwnProperty(byId[id])) out[byId[id]] = id; });
+  return out;
+}
+
 function selectState(expr, options) {
   var quoted = [];
   for (var i = 0; i < options.length; i++) quoted.push('\'' + options[i] + '\'');
@@ -426,6 +448,7 @@ function powerTimerPayload(topic, which, name, icon) {
 }
 
 function buildEntities(opts) {
+  var ssc = ssChoices();
   opts = opts || {};
   var topic = topics(opts.pfx);
   var installedApps = opts.installedApps || [];
@@ -873,8 +896,12 @@ function buildEntities(opts) {
           name: 'Input Source',
           command_topic: topic.command('input'),
           state_topic: topic.telemetry,
+          // Each option's input, which stays when the TV renames it: an
+          // automation can find the option by input rather than by name.
+          json_attributes_topic: topic.telemetry,
+          json_attributes_template: '{{ ' + JSON.stringify({ input_ids: inputIds(inputNames) }) + ' | tojson }}',
           icon: 'mdi:video-input-hdmi'
-        }, namedSelect(Object.keys(inputNames), inputNames, 'value_json.app'))
+        }, namedSelect(Object.keys(inputNames), inputNames, '(value_json.input_source or value_json.app)'))
       },
       {
         type: 'text', id: 'screen_notification',
@@ -1217,9 +1244,9 @@ function buildEntities(opts) {
           name: 'Screen Saver',
           command_topic: topic.command('screensaverMode'),
           state_topic: topic.telemetry,
-          options: SS_IDS.map(function (k) { return SS[k].label; }),
-          command_template: '{{ ' + JSON.stringify(ssMap(true)) + '[value] }}',
-          value_template: '{{ ' + JSON.stringify(ssMap(false)) + '.get(value_json.screensaverMode, "LG default") }}',
+          options: ssc.map(function (c) { return c[1]; }),
+          command_template: '{{ ' + JSON.stringify(ssMap(ssc, true)) + '[value] }}',
+          value_template: '{{ ' + JSON.stringify(ssMap(ssc, false)) + '.get(value_json.screensaverMode, "LG default") }}',
           icon: 'mdi:television-shimmer'
         }
       },
@@ -1327,13 +1354,46 @@ function buildEntities(opts) {
           icon: 'mdi:home'
         }
       },
+      // Typing into the focused text field, as LG's phone app does.
+      {
+        type: 'text', id: 'keyboard_text',
+        payload: {
+          name: 'Keyboard Text',
+          command_topic: topic.command('keyboardText'),
+          // A state that is always empty: without a state topic Home Assistant keeps each typed text as the
+          // entity's state, so the recorder and logbook would store whatever was typed (search terms, passwords).
+          state_topic: topic.telemetry,
+          value_template: "{{ '' }}",
+          icon: 'mdi:keyboard-outline',
+          mode: 'text',
+          max: 100 // controls.KEYBOARD_TEXT_MAX, which cuts longer text
+        }
+      },
+      {
+        type: 'button', id: 'keyboard_enter',
+        payload: {
+          name: 'Keyboard Enter',
+          command_topic: topic.command('keyboardKey'),
+          payload_press: 'enter',
+          icon: 'mdi:keyboard-return'
+        }
+      },
+      {
+        type: 'button', id: 'keyboard_backspace',
+        payload: {
+          name: 'Keyboard Backspace',
+          command_topic: topic.command('keyboardKey'),
+          payload_press: 'backspace',
+          icon: 'mdi:backspace-outline'
+        }
+      },
       {
         type: 'event', id: 'remote_button',
         payload: {
           name: 'Remote Button',
           state_topic: topic.eventsButton,
-          event_types: ['red', 'green', 'yellow', 'blue', 'netflix', 'amazon', 'disneyplus',
-            'lgchannels', 'rakutentv', 'alexa'],
+          // Home Assistant ignores an event type discovery does not name.
+          event_types: remotebuttons.buttonNames(),
           icon: 'mdi:remote'
         }
       },
@@ -1396,14 +1456,10 @@ function buildEntities(opts) {
     var updatePayload = {
       name: 'Server Update',
       state_topic: topic.update,
-      icon: 'mdi:package-up'
+      icon: 'mdi:package-up',
+      command_topic: topic.command('update'),
+      payload_install: 'install'
     };
-    // Without a command topic Home Assistant shows the release but no Install
-    // button, which is right where the Homebrew Channel does the updating.
-    if (!opts.updatesElsewhere) {
-      updatePayload.command_topic = topic.command('update');
-      updatePayload.payload_install = 'install';
-    }
     entities.push({ type: 'update', id: 'server_update', payload: updatePayload });
 
     if (opts.allowPower) {
@@ -1445,6 +1501,22 @@ function buildEntities(opts) {
         name: 'PicCap Capture',
         command_topic: topic.command('piccap/power'),
         state_topic: topic.state('piccap/power'),
+        payload_on: 'ON',
+        payload_off: 'OFF',
+        icon: 'mdi:television-ambient-light'
+      }
+    });
+  }
+
+  // Hue Sync's streaming to a Philips Ambience light, offered the same way:
+  // only while the app's service answers.
+  if (opts.huesync) {
+    entities.push({
+      type: 'switch', id: 'huesync',
+      payload: {
+        name: 'Hue Sync',
+        command_topic: topic.command('huesync/power'),
+        state_topic: topic.state('huesync/power'),
         payload_on: 'ON',
         payload_off: 'OFF',
         icon: 'mdi:television-ambient-light'

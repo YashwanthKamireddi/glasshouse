@@ -157,9 +157,16 @@ lg_home_pids() {
 # LG's would have: after a power-on LG opens Home for, and only while the input
 # the TV started on is still in front, so an input or app chosen since stays.
 # bootd logs the app it put in front as "'<id>' is foreground" (a G5, webOS
-# 10.3.1); without that line nothing is opened.
+# 10.3.1); without that line nothing is opened. With Quick Start+ on, auto
+# launch is left as the owner had it, and a C4 (webOS 10.3.1) with it on still
+# started on its last input after its 4 h full power-off, so LG's value is read
+# where home.json holds none; where bootd opened Home itself, the checks below
+# find Home rather than the input.
 home_open_at_boot() {
-  grep -q '"lgAutoLaunch"[[:space:]]*:[[:space:]]*"on"' /var/lib/tvweb/home.json 2>/dev/null || return 0
+  grep -q '"lgAutoLaunch"[[:space:]]*:[[:space:]]*"on"' /var/lib/tvweb/home.json 2>/dev/null ||
+    luna-send -n 1 luna://com.webos.service.settings/getSystemSettings \
+      '{"category":"general","keys":["homeAutoLaunch"]}' 2>/dev/null |
+      grep -q '"homeAutoLaunch": *"on"' || return 0
   reason=$(luna-send -n 1 luna://com.webos.service.tvpower/power/getPowerOnReason '{}' 2>/dev/null |
     sed -n 's/.*"reason": *"\([^"]*\)".*/\1/p')
   reasons=$(luna-send -n 1 luna://com.webos.service.config/getConfigs \
@@ -178,13 +185,18 @@ home_open_at_boot() {
     com.webos.app.livetv|com.webos.app.hdmi[0-9]|com.webos.app.av[0-9]|com.webos.app.comp[0-9]) ;;
     *) echo "$(date): Glasshouse Home not opened: the TV started on ${boot_app:-nothing logged}"; return 0 ;;
   esac
-  if [ "$front" != "$boot_app" ]; then
+  # On webOS 11.1 (50QNED72B6B) sam respawns com.webos.app.home once LG's Home
+  # is killed above, and reports it in front although nothing is drawn.
+  if [ "$front" != "$boot_app" ] && [ "$front" != com.webos.app.home ]; then
     echo "$(date): Glasshouse Home not opened: ${front:-nothing} in front since the start on $boot_app"
     return 0
   fi
   luna-send -n 1 luna://com.webos.applicationManager/launch '{"id":"com.webos.app.home"}' 2>/dev/null |
     grep -q '"returnValue": *true' || return 0
   home_opened=1
+  # The server watches for the view from its start and opens LG's Home if it
+  # does not come (lib/home.js watchBootOpen).
+  : > /tmp/glasshouse-home-opened-at-boot
   echo "$(date): Glasshouse Home opened over $boot_app"
 }
 home_opened=0
